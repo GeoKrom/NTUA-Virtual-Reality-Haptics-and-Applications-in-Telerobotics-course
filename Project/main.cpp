@@ -122,8 +122,8 @@ int windowHeight = 700;
 // MATERIAL / COLOR
 // ============================================================
 
-void setColor(float r, float g, float b)
-{
+void setColor(float r, float g, float b){
+    
     GLfloat color[] =
     {
         r, g, b, 1.0f
