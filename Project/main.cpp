@@ -1,28 +1,30 @@
 // ============================================================
-// ROBOTIC ARM - OpenGL + GLUT
+// ROBOTIC ARM WITH PHYSICS
+// OpenGL + GLUT
 // Linux / C++
-// ============================================================
 //
-// Controls:
-//
-// A / D       : Περιστροφή βάσης
-// W / S       : Κίνηση ώμου
-// Q / E       : Κίνηση αγκώνα
-// Z / X       : Άνοιγμα / κλείσιμο δακτύλων
-// P           : Σύλληψη αντικειμένου
-// L           : Απελευθέρωση αντικειμένου
-// R           : Reset
-//
-// Arrow Keys  : Περιστροφή κάμερας
-// + / -       : Zoom
-// ESC         : Έξοδος
-//
+// CONTROLS
+// ------------------------------------------------------------
+// A / D       : Rotate robot base
+// W / S       : Move shoulder
+// Q / E       : Move elbow
+// Z           : Open gripper
+// X           : Close gripper
+// P           : Try to grab object
+// L           : Release object
+// R           : Reset simulation
+// Arrow Keys  : Camera rotation
+// + / -       : Camera zoom
+// F           : Toggle force visualization
+// ESC         : Exit
 // ============================================================
 
 #include <GL/glut.h>
 #include <GL/glu.h>
+
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
 
 // ============================================================
 // CONSTANTS
@@ -32,39 +34,86 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+const float GRAVITY = 9.81f;
+const float PHYSICS_DT = 0.016f;
+
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+
+void resetSimulation();
+void updatePhysics();
+void display();
+void reshape(int width, int height);
+
+void keyboard(
+    unsigned char key,
+    int x,
+    int y
+);
+
+void specialKeys(
+    int key,
+    int x,
+    int y
+);
+
+void timer(int value);
+
+// ============================================================
+// OBJECT TYPES
+// ============================================================
+
+enum ObjectType
+{
+    SPHERE_OBJECT,
+    CYLINDER_OBJECT
+};
+
 // ============================================================
 // OBJECT STRUCTURE
 // ============================================================
 
 struct Object3D
 {
-    float x;
-    float y;
-    float z;
+    float x, y, z;
+
+    float vx, vy, vz;
+
+    float fx, fy, fz;
+
+    float mass;
 
     float radius;
 
+    float height;
+
+    float restitution;
+
+    float friction;
+
     bool grabbed;
-    bool isSphere;
+
+    ObjectType type;
 };
 
 // ============================================================
 // ROBOT PARAMETERS
 // ============================================================
 
-// Base
 float baseHeight = 1.0f;
 float baseRadius = 1.2f;
 
-// Arm lengths
 float L1 = 3.0f;
 float L2 = 2.5f;
 
-// Joint angles
-//
-// The arm starts in an elevated configuration.
-//
+// ============================================================
+// INITIAL ROBOT CONFIGURATION
+// ============================================================
+
 float baseAngle = 0.0f;
+
+// Elevated initial configuration
 float shoulderAngle = 55.0f;
 float elbowAngle = -15.0f;
 
@@ -72,12 +121,18 @@ float elbowAngle = -15.0f;
 // GRIPPER PARAMETERS
 // ============================================================
 
-float gripperOpening = 0.55f;
+// Distance of each finger from the gripper centerline.
+// The two fingers therefore remain mechanically attached to the palm.
+float gripperOpening = 0.88f;
 
-float fingerLength1 = 0.45f;
-float fingerLength2 = 0.40f;
+float minimumOpening = 0.12f;
+// Half-separation must accommodate the sphere/cylinder radius plus fingertip clearance.
+float maximumOpening = 0.90f;
 
-int grabbedObject = -1;
+float maxGripForce = 120.0f;
+
+float gripStiffness = 240.0f;
+float gripDamping = 22.0f;
 
 // ============================================================
 // OBJECTS
@@ -88,27 +143,67 @@ Object3D sphere =
     3.5f,
     0.0f,
     0.75f,
+
+    0.0f,
+    0.0f,
+    0.0f,
+
+    0.0f,
+    0.0f,
+    0.0f,
+
+    1.0f,
     0.75f,
+    1.5f,
+
+    0.58f,
+    0.55f,
+
     false,
-    true
+
+    SPHERE_OBJECT
 };
 
 Object3D cylinder =
 {
     -3.0f,
     1.5f,
-    0.8f,
-    0.7f,
+    0.80f,
+
+    0.0f,
+    0.0f,
+    0.0f,
+
+    0.0f,
+    0.0f,
+    0.0f,
+
+    1.5f,
+    0.70f,
+    1.60f,
+
+    0.42f,
+    0.60f,
+
     false,
-    false
+
+    CYLINDER_OBJECT
 };
+
+// ============================================================
+// GRABBED OBJECT
+// ============================================================
+
+int grabbedObject = -1;
 
 // ============================================================
 // CAMERA
 // ============================================================
 
 float cameraDistance = 15.0f;
+
 float cameraYaw = 45.0f;
+
 float cameraPitch = 25.0f;
 
 // ============================================================
@@ -119,14 +214,63 @@ int windowWidth = 1000;
 int windowHeight = 700;
 
 // ============================================================
-// MATERIAL / COLOR
+// FORCE VISUALIZATION
 // ============================================================
 
-void setColor(float r, float g, float b){
-    
+bool showForces = true;
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+float clampValue(
+    float value,
+    float minValue,
+    float maxValue
+)
+{
+    return std::max(
+        minValue,
+        std::min(
+            value,
+            maxValue
+        )
+    );
+}
+
+// ============================================================
+// VECTOR MAGNITUDE
+// ============================================================
+
+float vectorMagnitude(
+    float x,
+    float y,
+    float z
+)
+{
+    return std::sqrt(
+        x * x +
+        y * y +
+        z * z
+    );
+}
+
+// ============================================================
+// MATERIAL COLOR
+// ============================================================
+
+void setColor(
+    float r,
+    float g,
+    float b
+)
+{
     GLfloat color[] =
     {
-        r, g, b, 1.0f
+        r,
+        g,
+        b,
+        1.0f
     };
 
     glMaterialfv(
@@ -137,73 +281,7 @@ void setColor(float r, float g, float b){
 }
 
 // ============================================================
-// DRAW CYLINDER
-// ============================================================
-
-void drawCylinder(float radius, float height)
-{
-    GLUquadric* quadric = gluNewQuadric();
-
-    if (!quadric)
-        return;
-
-    gluCylinder(
-        quadric,
-        radius,
-        radius,
-        height,
-        32,
-        8
-    );
-
-    // Bottom cap
-    glPushMatrix();
-
-    glRotatef(180.0f, 1.0f, 0.0f, 0.0f);
-
-    gluDisk(
-        quadric,
-        0.0,
-        radius,
-        32,
-        1
-    );
-
-    glPopMatrix();
-
-    // Top cap
-    glPushMatrix();
-
-    glTranslatef(0.0f, 0.0f, height);
-
-    gluDisk(
-        quadric,
-        0.0,
-        radius,
-        32,
-        1
-    );
-
-    glPopMatrix();
-
-    gluDeleteQuadric(quadric);
-}
-
-// ============================================================
-// DRAW SPHERE
-// ============================================================
-
-void drawSphere(float radius)
-{
-    glutSolidSphere(
-        radius,
-        32,
-        32
-    );
-}
-
-// ============================================================
-// DRAW CUBE
+// CUBE
 // ============================================================
 
 void drawCube(
@@ -226,15 +304,96 @@ void drawCube(
 }
 
 // ============================================================
-// DRAW FLOOR
+// CYLINDER
+// ============================================================
+
+void drawCylinder(
+    float radius,
+    float height
+)
+{
+    GLUquadric* quadric =
+        gluNewQuadric();
+
+    if (!quadric)
+        return;
+
+    gluCylinder(
+        quadric,
+        radius,
+        radius,
+        height,
+        32,
+        8
+    );
+
+    glPushMatrix();
+
+    glRotatef(
+        180.0f,
+        1.0f,
+        0.0f,
+        0.0f
+    );
+
+    gluDisk(
+        quadric,
+        0.0,
+        radius,
+        32,
+        1
+    );
+
+    glPopMatrix();
+
+    glPushMatrix();
+
+    glTranslatef(
+        0.0f,
+        0.0f,
+        height
+    );
+
+    gluDisk(
+        quadric,
+        0.0,
+        radius,
+        32,
+        1
+    );
+
+    glPopMatrix();
+
+    gluDeleteQuadric(
+        quadric
+    );
+}
+
+// ============================================================
+// SPHERE
+// ============================================================
+
+void drawSphere(
+    float radius
+)
+{
+    glutSolidSphere(
+        radius,
+        32,
+        32
+    );
+}
+
+// ============================================================
+// FLOOR
 // ============================================================
 
 void drawFloor()
 {
     setColor(
-        0.12f,
-        0.14f,
-        0.16f
+        0.13f,
+        0.15f,
+        0.17f
     );
 
     glBegin(GL_QUADS);
@@ -273,7 +432,7 @@ void drawFloor()
 }
 
 // ============================================================
-// DRAW GRID
+// GRID
 // ============================================================
 
 void drawGrid()
@@ -290,7 +449,7 @@ void drawGrid()
 
     glBegin(GL_LINES);
 
-    for (int i = -10; i <= 10; i++)
+    for (int i = -10; i <= 10; ++i)
     {
         glVertex3f(
             (float)i,
@@ -323,15 +482,17 @@ void drawGrid()
 }
 
 // ============================================================
-// DRAW JOINT
+// JOINT
 // ============================================================
 
-void drawJoint(float radius)
+void drawJoint(
+    float radius
+)
 {
     setColor(
-        0.75f,
-        0.75f,
-        0.78f
+        0.80f,
+        0.82f,
+        0.85f
     );
 
     glutSolidSphere(
@@ -342,15 +503,15 @@ void drawJoint(float radius)
 }
 
 // ============================================================
-// DRAW ROBOT BASE
+// ROBOT BASE
 // ============================================================
 
 void drawRobotBase()
 {
     setColor(
         0.20f,
-        0.32f,
-        0.48f
+        0.34f,
+        0.52f
     );
 
     glPushMatrix();
@@ -368,11 +529,10 @@ void drawRobotBase()
 
     glPopMatrix();
 
-    // Rotating upper platform
     setColor(
         0.28f,
-        0.42f,
-        0.62f
+        0.43f,
+        0.64f
     );
 
     glPushMatrix();
@@ -392,17 +552,13 @@ void drawRobotBase()
 }
 
 // ============================================================
-// DRAW UPPER ARM
+// UPPER ARM
 // ============================================================
 
 void drawUpperArm()
 {
-    // Η συνάρτηση καλείται ήδη από τη θέση του ώμου
-    // και η περιστροφή του ώμου έχει εφαρμοστεί στο drawRobot().
-
     glPushMatrix();
 
-    // Το κέντρο του upper arm βρίσκεται στο L1/2
     glTranslatef(
         L1 / 2.0f,
         0.0f,
@@ -415,23 +571,24 @@ void drawUpperArm()
         0.72f
     );
 
+    // Thicker upper arm for a more robust mechanical appearance.
     drawCube(
         L1,
-        0.65f,
-        0.65f
+        0.95f,
+        0.95f
     );
 
     glPopMatrix();
 }
 
+// ============================================================
+// FOREARM
+// ============================================================
+
 void drawForearm()
 {
-    // Η συνάρτηση καλείται ήδη από τη θέση του αγκώνα
-    // και η γωνία του αγκώνα έχει εφαρμοστεί στο drawRobot().
-
     glPushMatrix();
 
-    // Το κέντρο του forearm βρίσκεται στο L2/2
     glTranslatef(
         L2 / 2.0f,
         0.0f,
@@ -444,37 +601,44 @@ void drawForearm()
         0.62f
     );
 
+    // Thicker forearm, while keeping the same length and kinematics.
     drawCube(
         L2,
-        0.55f,
-        0.55f
+        0.80f,
+        0.80f
     );
 
     glPopMatrix();
 }
+
 // ============================================================
-// DRAW FINGER
+// FINGER
 // ============================================================
 
-void drawFinger(float yOffset)
+void drawFinger(
+    float yOffset
+)
 {
+    // Mechanical travel limit:
+    // each finger can only move within the palm width.
+    // This prevents the fingers from escaping into free space.
+    yOffset = clampValue(
+        yOffset,
+        -maximumOpening,
+        maximumOpening
+    );
+
     glPushMatrix();
 
-    // --------------------------------------------------------
-    // Το finger ξεκινά ακριβώς από το άκρο του forearm.
-    // Δεν κάνουμε επιπλέον μετατόπιση κατά L2.
-    // --------------------------------------------------------
-
+    // Lateral position of the finger.
+    // The finger remains attached to the gripper palm.
     glTranslatef(
         0.0f,
         yOffset,
         0.0f
     );
 
-    // ========================================================
-    // ΠΡΩΤΗ ΦΑΛΑΓΓΑ
-    // ========================================================
-
+    // First phalange
     glPushMatrix();
 
     glTranslatef(
@@ -497,10 +661,7 @@ void drawFinger(float yOffset)
 
     glPopMatrix();
 
-    // ========================================================
-    // ΔΕΥΤΕΡΗ ΦΑΛΑΓΓΑ
-    // ========================================================
-
+    // Second phalange
     glPushMatrix();
 
     glTranslatef(
@@ -524,10 +685,7 @@ void drawFinger(float yOffset)
 
     glPopMatrix();
 
-    // ========================================================
-    // ΑΚΡΟ ΔΑΚΤΥΛΟΥ
-    // ========================================================
-
+    // Fingertip
     glPushMatrix();
 
     glTranslatef(
@@ -552,21 +710,19 @@ void drawFinger(float yOffset)
 
     glPopMatrix();
 }
+
 // ============================================================
-// DRAW GRIPPER
+// GRIPPER
 // ============================================================
 
 void drawGripper()
 {
     glPushMatrix();
 
-    // Το gripper βρίσκεται ΗΔΗ στο άκρο του forearm.
-    // Δεν κάνουμε επιπλέον μετατόπιση κατά L2.
+    // The coordinate system is already at the
+    // end of the forearm.
 
-    // ---------------------------------------------
-    // Palm / βάση δακτύλων
-    // ---------------------------------------------
-
+    // Palm
     setColor(
         0.35f,
         0.40f,
@@ -583,32 +739,27 @@ void drawGripper()
 
     drawCube(
         0.30f,
-        1.10f,
+        2.00f,
         0.35f
     );
 
     glPopMatrix();
 
-    // ---------------------------------------------
-    // Αριστερό δάκτυλο
-    // ---------------------------------------------
-
+    // Left finger
     drawFinger(
         gripperOpening
     );
 
-    // ---------------------------------------------
-    // Δεξί δάκτυλο
-    // ---------------------------------------------
-
+    // Right finger
     drawFinger(
         -gripperOpening
     );
 
     glPopMatrix();
 }
+
 // ============================================================
-// CALCULATE END EFFECTOR
+// END EFFECTOR KINEMATICS
 // ============================================================
 
 void calculateEndEffector(
@@ -618,39 +769,91 @@ void calculateEndEffector(
 )
 {
     float theta1 =
-        shoulderAngle * M_PI / 180.0f;
+        shoulderAngle *
+        M_PI /
+        180.0f;
 
     float theta2 =
-        elbowAngle * M_PI / 180.0f;
+        elbowAngle *
+        M_PI /
+        180.0f;
 
     float base =
-        baseAngle * M_PI / 180.0f;
+        baseAngle *
+        M_PI /
+        180.0f;
 
-    // Συνολική οριζόντια απόσταση
     float horizontal =
-        L1 * cos(theta1)
+        L1 * std::cos(theta1)
         +
-        L2 * cos(theta1 + theta2);
+        L2 * std::cos(theta1 + theta2);
 
-    // Ύψος end-effector
     z =
         baseHeight
-        + 0.35f
         +
-        L1 * sin(theta1)
+        0.35f
         +
-        L2 * sin(theta1 + theta2);
+        L1 * std::sin(theta1)
+        +
+        L2 * std::sin(theta1 + theta2);
 
-    // Περιστροφή βάσης
     x =
-        horizontal * cos(base);
+        horizontal *
+        std::cos(base);
 
     y =
-        horizontal * sin(base);
+        horizontal *
+        std::sin(base);
 }
 
 // ============================================================
-// DRAW SPHERE OBJECT
+// END EFFECTOR DIRECTION
+// ============================================================
+
+void calculateEndEffectorDirection(
+    float& dx,
+    float& dy,
+    float& dz
+)
+{
+    float theta1 =
+        shoulderAngle *
+        M_PI /
+        180.0f;
+
+    float theta2 =
+        elbowAngle *
+        M_PI /
+        180.0f;
+
+    float base =
+        baseAngle *
+        M_PI /
+        180.0f;
+
+    float angle =
+        theta1 + theta2;
+
+    float localX =
+        std::cos(angle);
+
+    float localZ =
+        std::sin(angle);
+
+    dx =
+        localX *
+        std::cos(base);
+
+    dy =
+        localX *
+        std::sin(base);
+
+    dz =
+        localZ;
+}
+
+// ============================================================
+// OBJECT DRAWING
 // ============================================================
 
 void drawSphereObject()
@@ -677,8 +880,6 @@ void drawSphereObject()
 }
 
 // ============================================================
-// DRAW CYLINDER OBJECT
-// ============================================================
 
 void drawCylinderObject()
 {
@@ -693,52 +894,251 @@ void drawCylinderObject()
     glTranslatef(
         cylinder.x,
         cylinder.y,
-        cylinder.z
+        cylinder.z -
+        cylinder.height / 2.0f
     );
 
     drawCylinder(
         cylinder.radius,
-        1.6f
+        cylinder.height
     );
 
     glPopMatrix();
 }
 
 // ============================================================
-// DRAW OBJECTS
-// ============================================================
 
 void drawObjects()
 {
     drawSphereObject();
+
     drawCylinderObject();
 }
 
 // ============================================================
-// DISTANCE TO OBJECT
+// PHYSICS: GRAVITY
 // ============================================================
 
-float distanceToObject(
-    float x,
-    float y,
-    float z,
+void applyGravity(
+    Object3D& object
+)
+{
+    object.fz -=
+        object.mass *
+        GRAVITY;
+}
+
+// ============================================================
+// PHYSICS: FLOOR CONTACT
+// ============================================================
+// The floor is treated as a rigid unilateral constraint:
+//
+//     z_bottom >= 0
+//
+// A penalty force is generated during penetration, while a
+// post-integration constraint correction guarantees that the
+// object can never remain below the floor.
+// ============================================================
+
+float getObjectBottom(const Object3D& object)
+{
+    if (object.type == SPHERE_OBJECT)
+    {
+        return object.z - object.radius;
+    }
+
+    return object.z - object.height / 2.0f;
+}
+
+float getObjectFloorHeight(const Object3D& object)
+{
+    if (object.type == SPHERE_OBJECT)
+    {
+        return object.radius;
+    }
+
+    return object.height / 2.0f;
+}
+
+void applyFloorContact(Object3D& object)
+{
+    const float bottom =
+        getObjectBottom(object);
+
+    // No contact if the object is above the floor.
+    if (bottom > 0.0f)
+        return;
+
+    const float penetration =
+        -bottom;
+
+    // Rigid-contact parameters.
+    const float contactStiffness =
+        5000.0f;
+
+    const float contactDamping =
+        180.0f;
+
+    // Normal force:
+    //
+    // F_n = K_p delta - K_d v_n
+    //
+    // where delta is the penetration depth.
+    float normalForce =
+        contactStiffness * penetration
+        - contactDamping * object.vz;
+
+    // The floor can push the object upward, but cannot pull it.
+    if (normalForce < 0.0f)
+        normalForce = 0.0f;
+
+    object.fz += normalForce;
+
+    // Horizontal floor friction is handled in resolveFloorContact()
+    // using stable velocity damping, avoiding numerical chatter.
+}
+
+// ============================================================
+// RIGID FLOOR CONSTRAINT
+// ============================================================
+// This function is executed AFTER numerical integration.
+// Therefore, even if Euler integration produces a tiny
+// penetration during a time step, the object is immediately
+// projected back onto the floor.
+// ============================================================
+
+void resolveFloorContact(Object3D& object)
+{
+    const float floorHeight =
+        getObjectFloorHeight(object);
+
+    // Resolve a collision only when the object reaches/crosses
+    // the floor. Save the impact speed before correcting position.
+    if (object.z <= floorHeight)
+    {
+        const float impactSpeed =
+            (object.vz < 0.0f) ? -object.vz : 0.0f;
+
+        object.z = floorHeight;
+
+        // Bounce after a real impact. Low-speed contacts are
+        // treated as resting contact to avoid endless micro-bounces.
+        const float bounceThreshold = 0.70f;
+        if (impactSpeed > bounceThreshold)
+        {
+            object.vz = object.restitution * impactSpeed;
+        }
+        else
+        {
+            object.vz = 0.0f;
+        }
+
+        // Friction/damping on the floor. Exponential damping is
+        // stable and avoids the velocity sign-flipping caused by
+        // applying a constant friction force near zero speed.
+        const float horizontalDamping = 7.0f;
+        const float dampingFactor =
+            std::exp(-horizontalDamping * PHYSICS_DT);
+
+        object.vx *= dampingFactor;
+        object.vy *= dampingFactor;
+
+        // Static-friction dead zone: the object eventually comes
+        // to rest without sliding or jittering indefinitely.
+        if (std::fabs(object.vx) < 0.025f)
+            object.vx = 0.0f;
+        if (std::fabs(object.vy) < 0.025f)
+            object.vy = 0.0f;
+    }
+}
+
+// ============================================================
+// GRIPPER TARGET
+// ============================================================
+
+void getGripperTarget(
+    float& x,
+    float& y,
+    float& z
+)
+{
+    calculateEndEffector(
+        x,
+        y,
+        z
+    );
+
+    float dx;
+    float dy;
+    float dz;
+
+    calculateEndEffectorDirection(
+        dx,
+        dy,
+        dz
+    );
+
+    // Move slightly forward from the wrist
+    // so that the object is located between
+    // the two fingers.
+    x += dx * 0.45f;
+    y += dy * 0.45f;
+    z += dz * 0.45f;
+}
+
+// ============================================================
+// DISTANCE TO GRIPPER
+// ============================================================
+
+float distanceToGripper(
     const Object3D& object
 )
 {
-    float dx =
-        x - object.x;
+    float gx;
+    float gy;
+    float gz;
 
-    float dy =
-        y - object.y;
-
-    float dz =
-        z - object.z;
-
-    return sqrt(
-        dx * dx +
-        dy * dy +
-        dz * dz
+    getGripperTarget(
+        gx,
+        gy,
+        gz
     );
+
+    return vectorMagnitude(
+        object.x - gx,
+        object.y - gy,
+        object.z - gz
+    );
+}
+
+// ============================================================
+// OBJECT CAN BE GRABBED
+// ============================================================
+
+bool objectCanBeGrabbed(
+    const Object3D& object
+)
+{
+    float gx, gy, gz;
+    getGripperTarget(gx, gy, gz);
+
+    const float distance = vectorMagnitude(
+        object.x - gx,
+        object.y - gy,
+        object.z - gz
+    );
+
+    // Opening is the offset of each finger from the centerline.
+    // Keep a small clearance, but do not make the condition
+    // impossible for the sphere/cylinder used in this scene.
+    const float requiredOpening = object.radius + 0.08f;
+    if (gripperOpening < requiredOpening)
+        return false;
+
+    // The object must be brought close to the gripper first.
+    // The slightly generous radius accounts for the size of the object.
+    const float captureDistance = object.radius + 1.00f;
+    return distance <= captureDistance;
 }
 
 // ============================================================
@@ -747,92 +1147,420 @@ float distanceToObject(
 
 void tryGrab()
 {
-    float endX;
-    float endY;
-    float endZ;
-
-    calculateEndEffector(
-        endX,
-        endY,
-        endZ
-    );
-
-    const float grabDistance = 1.40f;
-
-    // Check sphere
-    if (!sphere.grabbed)
-    {
-        float d =
-            distanceToObject(
-                endX,
-                endY,
-                endZ,
-                sphere
-            );
-
-        if (d < grabDistance)
-        {
-            sphere.grabbed = true;
-            grabbedObject = 0;
-            return;
-        }
-    }
-
-    // Check cylinder
-    if (!cylinder.grabbed)
-    {
-        float d =
-            distanceToObject(
-                endX,
-                endY,
-                endZ,
-                cylinder
-            );
-
-        if (d < grabDistance)
-        {
-            cylinder.grabbed = true;
-            grabbedObject = 1;
-            return;
-        }
-    }
-}
-
-// ============================================================
-// UPDATE GRABBED OBJECT
-// ============================================================
-
-void updateGrabbedObject()
-{
-    if (grabbedObject == -1)
+    if (grabbedObject != -1)
         return;
 
-    float endX;
-    float endY;
-    float endZ;
+    const bool sphereReady = objectCanBeGrabbed(sphere);
+    const bool cylinderReady = objectCanBeGrabbed(cylinder);
 
-    calculateEndEffector(
-        endX,
-        endY,
-        endZ
-    );
+    if (!sphereReady && !cylinderReady)
+        return;
 
-    if (grabbedObject == 0)
+    // If both objects happen to be in range, grab the nearer one.
+    if (sphereReady && cylinderReady)
     {
-        sphere.x = endX;
-        sphere.y = endY;
-        sphere.z = endZ - 0.65f;
+        if (distanceToGripper(sphere) <= distanceToGripper(cylinder))
+        {
+            grabbedObject = 0;
+            sphere.grabbed = true;
+            sphere.vx = sphere.vy = sphere.vz = 0.0f;
+        }
+        else
+        {
+            grabbedObject = 1;
+            cylinder.grabbed = true;
+            cylinder.vx = cylinder.vy = cylinder.vz = 0.0f;
+        }
+        return;
     }
-    else if (grabbedObject == 1)
+
+    if (sphereReady)
     {
-        cylinder.x = endX;
-        cylinder.y = endY;
-        cylinder.z = endZ - 0.80f;
+        grabbedObject = 0;
+        sphere.grabbed = true;
+        sphere.vx = sphere.vy = sphere.vz = 0.0f;
+    }
+    else
+    {
+        grabbedObject = 1;
+        cylinder.grabbed = true;
+        cylinder.vx = cylinder.vy = cylinder.vz = 0.0f;
     }
 }
 
 // ============================================================
-// RELEASE OBJECT
+// GRIPPER SPRING-DAMPER FORCE
+// ============================================================
+
+void applyGripperForce(
+    Object3D& object
+)
+{
+    if (!object.grabbed)
+        return;
+
+    float targetX;
+    float targetY;
+    float targetZ;
+
+    getGripperTarget(
+        targetX,
+        targetY,
+        targetZ
+    );
+
+    // Position error
+    float ex =
+        targetX -
+        object.x;
+
+    float ey =
+        targetY -
+        object.y;
+
+    float ez =
+        targetZ -
+        object.z;
+
+    // Relative velocity
+    float evx =
+        -object.vx;
+
+    float evy =
+        -object.vy;
+
+    float evz =
+        -object.vz;
+
+    // Spring-damper model:
+    //
+    // F = K e + C de/dt
+    //
+    float fx =
+        gripStiffness * ex
+        +
+        gripDamping * evx;
+
+    float fy =
+        gripStiffness * ey
+        +
+        gripDamping * evy;
+
+    float fz =
+        gripStiffness * ez
+        +
+        gripDamping * evz;
+
+    float magnitude =
+        vectorMagnitude(
+            fx,
+            fy,
+            fz
+        );
+
+    // Saturation of gripping force
+    if (magnitude > maxGripForce)
+    {
+        float scale =
+            maxGripForce /
+            magnitude;
+
+        fx *= scale;
+        fy *= scale;
+        fz *= scale;
+    }
+
+    object.fx += fx;
+    object.fy += fy;
+    object.fz += fz;
+
+}
+
+// ============================================================
+// RESET FORCES
+// ============================================================
+
+void resetForces(
+    Object3D& object
+)
+{
+    object.fx = 0.0f;
+    object.fy = 0.0f;
+    object.fz = 0.0f;
+}
+
+// ============================================================
+// NUMERICAL INTEGRATION
+// ============================================================
+
+void integratePhysics(
+    Object3D& object,
+    float dt
+)
+{
+    // Newton's second law:
+    //
+    // a = F / m
+
+    float ax =
+        object.fx /
+        object.mass;
+
+    float ay =
+        object.fy /
+        object.mass;
+
+    float az =
+        object.fz /
+        object.mass;
+
+    // Euler integration for velocity
+    object.vx +=
+        ax * dt;
+
+    object.vy +=
+        ay * dt;
+
+    object.vz +=
+        az * dt;
+
+    // Velocity saturation
+    const float maxVelocity =
+        12.0f;
+
+    float velocityMagnitude =
+        vectorMagnitude(
+            object.vx,
+            object.vy,
+            object.vz
+        );
+
+    if (velocityMagnitude >
+        maxVelocity)
+    {
+        float scale =
+            maxVelocity /
+            velocityMagnitude;
+
+        object.vx *= scale;
+        object.vy *= scale;
+        object.vz *= scale;
+    }
+
+    // Euler integration for position
+    object.x +=
+        object.vx * dt;
+
+    object.y +=
+        object.vy * dt;
+
+    object.z +=
+        object.vz * dt;
+}
+
+// ============================================================
+// UPDATE SINGLE OBJECT
+// ============================================================
+
+void updateObjectPhysics(
+    Object3D& object
+)
+{
+    // A grasped object is kinematically attached to the gripper.
+    // This avoids the old spring-force approach, which could fail
+    // to carry the object because gravity and force saturation kept
+    // it near the floor. Its velocity is estimated from the target
+    // motion so that releasing it preserves the motion naturally.
+    if (object.grabbed)
+    {
+        float targetX, targetY, targetZ;
+        getGripperTarget(targetX, targetY, targetZ);
+
+        object.vx = (targetX - object.x) / PHYSICS_DT;
+        object.vy = (targetY - object.y) / PHYSICS_DT;
+        object.vz = (targetZ - object.z) / PHYSICS_DT;
+
+        object.x = targetX;
+        object.y = targetY;
+        object.z = targetZ;
+        resetForces(object);
+        return;
+    }
+
+    resetForces(object);
+
+    // Gravity
+    applyGravity(object);
+
+    // Floor contact
+    applyFloorContact(object);
+
+    // Gripper force
+    if (object.grabbed)
+    {
+        applyGripperForce(object);
+    }
+
+    // Integrate dynamics
+    integratePhysics(
+        object,
+        PHYSICS_DT
+    );
+
+    // Enforce the rigid floor constraint AFTER integration.
+    // This is what prevents the sphere/cylinder from passing
+    // through the floor due to the discrete time step.
+    resolveFloorContact(object);
+}
+
+// ============================================================
+// OBJECT-OBJECT COLLISION DETECTION AND RESPONSE
+// ============================================================
+// The objects are represented for collision purposes by vertical
+// bounding volumes: a horizontal disk of radius `radius` and the
+// object's displayed vertical extent. This is sufficient for the
+// sphere/cylinder scene and prevents them from passing through one
+// another or settling inside one another.
+
+float objectHalfHeight(const Object3D& object)
+{
+    return (object.type == SPHERE_OBJECT)
+        ? object.radius
+        : 0.5f * object.height;
+}
+
+void resolveObjectCollision(Object3D& a, Object3D& b)
+{
+    const float dx = b.x - a.x;
+    const float dy = b.y - a.y;
+    const float distanceXY = std::sqrt(dx * dx + dy * dy);
+    const float overlapXY = a.radius + b.radius - distanceXY;
+
+    const float halfA = objectHalfHeight(a);
+    const float halfB = objectHalfHeight(b);
+    const float bottomA = a.z - halfA;
+    const float topA = a.z + halfA;
+    const float bottomB = b.z - halfB;
+    const float topB = b.z + halfB;
+    const float overlapZ = std::min(topA, topB) - std::max(bottomA, bottomB);
+
+    if (overlapXY <= 0.0f || overlapZ <= 0.0f)
+        return;
+
+    // If one object is held, keep it attached to the gripper and
+    // move the free object out of the held object's collision volume.
+    const bool aFixed = a.grabbed;
+    const bool bFixed = b.grabbed;
+    if (aFixed && bFixed)
+        return;
+
+    // Choose the axis with the least penetration. Vertical resolution
+    // produces stable stacking; horizontal resolution separates objects
+    // that collide while resting side-by-side on the floor.
+    if (overlapZ < overlapXY)
+    {
+        const bool aIsLower = a.z <= b.z;
+        Object3D& lower = aIsLower ? a : b;
+        Object3D& upper = aIsLower ? b : a;
+        const float penetration = std::min(topA, topB) - std::max(bottomA, bottomB);
+
+        if (aFixed || bFixed)
+        {
+            if (aFixed) {
+                if (a.z <= b.z) b.z += penetration; else b.z -= penetration;
+            } else {
+                if (b.z <= a.z) a.z += penetration; else a.z -= penetration;
+            }
+        }
+        else
+        {
+            lower.z -= 0.5f * penetration;
+            upper.z += 0.5f * penetration;
+        }
+
+        // Remove velocity directed into the contact and apply a modest
+        // bounce only on a sufficiently energetic impact.
+        Object3D& moving = (aFixed || bFixed) ? (aFixed ? b : a) : upper;
+        if (moving.vz < 0.0f && moving.z >= lower.z)
+            moving.vz = 0.0f;
+        else if (moving.vz > 0.0f && moving.z <= lower.z)
+            moving.vz = 0.0f;
+    }
+    else
+    {
+        float nx, ny;
+        if (distanceXY > 1.0e-5f) {
+            nx = dx / distanceXY;
+            ny = dy / distanceXY;
+        } else {
+            nx = 1.0f; ny = 0.0f;
+        }
+
+        const float penetration = overlapXY;
+        if (aFixed)
+        {
+            b.x += nx * penetration;
+            b.y += ny * penetration;
+        }
+        else if (bFixed)
+        {
+            a.x -= nx * penetration;
+            a.y -= ny * penetration;
+        }
+        else
+        {
+            a.x -= 0.5f * nx * penetration;
+            a.y -= 0.5f * ny * penetration;
+            b.x += 0.5f * nx * penetration;
+            b.y += 0.5f * ny * penetration;
+        }
+
+        const float relativeNormalVelocity =
+            (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+        if (relativeNormalVelocity < 0.0f)
+        {
+            const float invMassA = aFixed ? 0.0f : 1.0f / a.mass;
+            const float invMassB = bFixed ? 0.0f : 1.0f / b.mass;
+            const float invMassSum = invMassA + invMassB;
+            if (invMassSum > 0.0f)
+            {
+                const float impulse = -(1.0f + 0.05f) * relativeNormalVelocity / invMassSum;
+                a.vx -= impulse * invMassA * nx;
+                a.vy -= impulse * invMassA * ny;
+                b.vx += impulse * invMassB * nx;
+                b.vy += impulse * invMassB * ny;
+            }
+        }
+    }
+
+    // Keep both objects above the floor after positional correction.
+    if (!a.grabbed && a.z < getObjectFloorHeight(a)) {
+        a.z = getObjectFloorHeight(a);
+        if (a.vz < 0.0f) a.vz = 0.0f;
+    }
+    if (!b.grabbed && b.z < getObjectFloorHeight(b)) {
+        b.z = getObjectFloorHeight(b);
+        if (b.vz < 0.0f) b.vz = 0.0f;
+    }
+}
+
+// ============================================================
+// PHYSICS UPDATE
+// ============================================================
+
+void updatePhysics()
+{
+    updateObjectPhysics(sphere);
+    updateObjectPhysics(cylinder);
+
+    // Multiple short solver passes reduce residual overlap and improve
+    // stability when an object is released while touching another.
+    for (int pass = 0; pass < 4; ++pass)
+        resolveObjectCollision(sphere, cylinder);
+}
+
+// ============================================================
+// RELEASE
 // ============================================================
 
 void releaseGrabbedObject()
@@ -850,48 +1578,138 @@ void releaseGrabbedObject()
 }
 
 // ============================================================
-// RESET ROBOT
+// FORCE ARROW
 // ============================================================
 
-void resetRobot()
+void drawArrow(
+    float x,
+    float y,
+    float z,
+    float fx,
+    float fy,
+    float fz,
+    float scale
+)
 {
-    // Elevated initial configuration
-    baseAngle = 0.0f;
+    float magnitude =
+        vectorMagnitude(
+            fx,
+            fy,
+            fz
+        );
 
-    shoulderAngle = 55.0f;
+    if (magnitude < 0.01f)
+        return;
 
-    elbowAngle = -15.0f;
+    float dx =
+        fx / magnitude;
 
-    gripperOpening = 0.55f;
+    float dy =
+        fy / magnitude;
 
-    grabbedObject = -1;
+    float dz =
+        fz / magnitude;
 
-    sphere.grabbed = false;
-    cylinder.grabbed = false;
+    float length =
+        std::min(
+            magnitude * scale,
+            2.0f
+        );
 
-    // Reset sphere
-    sphere.x = 3.5f;
-    sphere.y = 0.0f;
-    sphere.z = 0.75f;
+    float endX =
+        x + dx * length;
 
-    // Reset cylinder
-    cylinder.x = -3.0f;
-    cylinder.y = 1.5f;
-    cylinder.z = 0.8f;
+    float endY =
+        y + dy * length;
+
+    float endZ =
+        z + dz * length;
+
+    glDisable(GL_LIGHTING);
+
+    glLineWidth(3.0f);
+
+    glColor3f(
+        1.0f,
+        0.2f,
+        0.1f
+    );
+
+    glBegin(GL_LINES);
+
+    glVertex3f(
+        x,
+        y,
+        z
+    );
+
+    glVertex3f(
+        endX,
+        endY,
+        endZ
+    );
+
+    glEnd();
+
+    glPushMatrix();
+
+    glTranslatef(
+        endX,
+        endY,
+        endZ
+    );
+
+    glutSolidCone(
+        0.08f,
+        0.25f,
+        8,
+        4
+    );
+
+    glPopMatrix();
+
+    glEnable(GL_LIGHTING);
 }
 
 // ============================================================
-// DRAW ROBOT
+// FORCE VISUALIZATION
+// ============================================================
+
+void drawForces()
+{
+    if (!showForces)
+        return;
+
+    drawArrow(
+        sphere.x,
+        sphere.y,
+        sphere.z,
+        sphere.fx,
+        sphere.fy,
+        sphere.fz,
+        0.03f
+    );
+
+    drawArrow(
+        cylinder.x,
+        cylinder.y,
+        cylinder.z,
+        cylinder.fx,
+        cylinder.fy,
+        cylinder.fz,
+        0.03f
+    );
+}
+
+// ============================================================
+// ROBOT
 // ============================================================
 
 void drawRobot()
 {
     glPushMatrix();
 
-    // ========================================================
-    // BASE
-    // ========================================================
-
+    // Base rotation
     glRotatef(
         baseAngle,
         0.0f,
@@ -899,12 +1717,10 @@ void drawRobot()
         1.0f
     );
 
+    // Base
     drawRobotBase();
 
-    // ========================================================
-    // MOVE TO SHOULDER
-    // ========================================================
-
+    // Move to shoulder
     glTranslatef(
         0.0f,
         0.0f,
@@ -912,12 +1728,11 @@ void drawRobot()
     );
 
     // Shoulder joint
-    drawJoint(0.40f);
+    drawJoint(
+        0.40f
+    );
 
-    // ========================================================
-    // SHOULDER ROTATION
-    // ========================================================
-
+    // Shoulder rotation
     glRotatef(
         -shoulderAngle,
         0.0f,
@@ -925,16 +1740,10 @@ void drawRobot()
         0.0f
     );
 
-    // ========================================================
-    // UPPER ARM
-    // ========================================================
-
+    // Upper arm
     drawUpperArm();
 
-    // ========================================================
-    // MOVE TO ELBOW
-    // ========================================================
-
+    // Move to elbow
     glTranslatef(
         L1,
         0.0f,
@@ -942,12 +1751,11 @@ void drawRobot()
     );
 
     // Elbow joint
-    drawJoint(0.32f);
+    drawJoint(
+        0.32f
+    );
 
-    // ========================================================
-    // ELBOW ROTATION
-    // ========================================================
-
+    // Elbow rotation
     glRotatef(
         -elbowAngle,
         0.0f,
@@ -955,26 +1763,17 @@ void drawRobot()
         0.0f
     );
 
-    // ========================================================
-    // FOREARM
-    // ========================================================
-
+    // Forearm
     drawForearm();
 
-    // ========================================================
-    // MOVE TO END OF FOREARM
-    // ========================================================
-
+    // Move exactly to the end of forearm
     glTranslatef(
         L2,
         0.0f,
         0.0f
     );
 
-    // ========================================================
-    // GRIPPER
-    // ========================================================
-
+    // Gripper
     drawGripper();
 
     glPopMatrix();
@@ -986,9 +1785,13 @@ void drawRobot()
 
 void setupLighting()
 {
-    glEnable(GL_LIGHTING);
+    glEnable(
+        GL_LIGHTING
+    );
 
-    glEnable(GL_LIGHT0);
+    glEnable(
+        GL_LIGHT0
+    );
 
     GLfloat ambient[] =
     {
@@ -1046,7 +1849,9 @@ void setupLighting()
         position
     );
 
-    glEnable(GL_COLOR_MATERIAL);
+    glEnable(
+        GL_COLOR_MATERIAL
+    );
 
     glColorMaterial(
         GL_FRONT_AND_BACK,
@@ -1071,29 +1876,28 @@ void setupCamera()
     glLoadIdentity();
 
     float yawRad =
-        cameraYaw * M_PI / 180.0f;
+        cameraYaw *
+        M_PI /
+        180.0f;
 
     float pitchRad =
-        cameraPitch * M_PI / 180.0f;
+        cameraPitch *
+        M_PI /
+        180.0f;
 
     float camX =
-        cameraDistance
-        *
-        cos(pitchRad)
-        *
-        sin(yawRad);
+        cameraDistance *
+        std::cos(pitchRad) *
+        std::sin(yawRad);
 
     float camY =
-        cameraDistance
-        *
-        cos(pitchRad)
-        *
-        cos(yawRad);
+        cameraDistance *
+        std::cos(pitchRad) *
+        std::cos(yawRad);
 
     float camZ =
-        cameraDistance
-        *
-        sin(pitchRad);
+        cameraDistance *
+        std::sin(pitchRad);
 
     gluLookAt(
         camX,
@@ -1123,17 +1927,15 @@ void display()
 
     setupCamera();
 
-    // Floor
     drawFloor();
 
-    // Grid
     drawGrid();
 
-    // Objects
     drawObjects();
 
-    // Robot
     drawRobot();
+
+    drawForces();
 
     glutSwapBuffers();
 }
@@ -1168,7 +1970,8 @@ void reshape(
 
     gluPerspective(
         45.0,
-        (double)width / (double)height,
+        (double)width /
+        (double)height,
         0.1,
         100.0
     );
@@ -1176,6 +1979,52 @@ void reshape(
     glMatrixMode(
         GL_MODELVIEW
     );
+}
+
+// ============================================================
+// RESET SIMULATION
+// ============================================================
+
+void resetSimulation()
+{
+    // Robot
+    baseAngle = 0.0f;
+
+    shoulderAngle = 55.0f;
+
+    elbowAngle = -15.0f;
+
+    gripperOpening = 0.88f;
+
+    // Grabbing state
+    grabbedObject = -1;
+
+    sphere.grabbed = false;
+    cylinder.grabbed = false;
+
+    // Sphere initial condition
+    sphere.x = 3.5f;
+    sphere.y = 0.0f;
+    sphere.z = sphere.radius;
+
+    sphere.vx = 0.0f;
+    sphere.vy = 0.0f;
+    sphere.vz = 0.0f;
+
+    // Cylinder initial condition
+    cylinder.x = -3.0f;
+    cylinder.y = 1.5f;
+
+    cylinder.z =
+        cylinder.height / 2.0f;
+
+    cylinder.vx = 0.0f;
+    cylinder.vy = 0.0f;
+    cylinder.vz = 0.0f;
+
+    resetForces(sphere);
+
+    resetForces(cylinder);
 }
 
 // ============================================================
@@ -1196,12 +2045,16 @@ void keyboard(
 
         case 'a':
         case 'A':
+
             baseAngle += 5.0f;
+
             break;
 
         case 'd':
         case 'D':
+
             baseAngle -= 5.0f;
+
             break;
 
         // ----------------------------------------------------
@@ -1210,12 +2063,30 @@ void keyboard(
 
         case 'w':
         case 'W':
+
             shoulderAngle += 3.0f;
+
+            shoulderAngle =
+                clampValue(
+                    shoulderAngle,
+                    -20.0f,
+                    80.0f
+                );
+
             break;
 
         case 's':
         case 'S':
+
             shoulderAngle -= 3.0f;
+
+            shoulderAngle =
+                clampValue(
+                    shoulderAngle,
+                    -20.0f,
+                    80.0f
+                );
+
             break;
 
         // ----------------------------------------------------
@@ -1224,35 +2095,65 @@ void keyboard(
 
         case 'q':
         case 'Q':
+
             elbowAngle += 3.0f;
+
+            elbowAngle =
+                clampValue(
+                    elbowAngle,
+                    -120.0f,
+                    120.0f
+                );
+
             break;
 
         case 'e':
         case 'E':
+
             elbowAngle -= 3.0f;
+
+            elbowAngle =
+                clampValue(
+                    elbowAngle,
+                    -120.0f,
+                    120.0f
+                );
+
             break;
 
         // ----------------------------------------------------
-        // GRIPPER
+        // OPEN GRIPPER
         // ----------------------------------------------------
 
         case 'z':
         case 'Z':
 
-            gripperOpening += 0.05f;
+            gripperOpening += 0.04f;
 
-            if (gripperOpening > 1.0f)
-                gripperOpening = 1.0f;
+            if (gripperOpening >
+                maximumOpening)
+            {
+                gripperOpening =
+                    maximumOpening;
+            }
 
             break;
+
+        // ----------------------------------------------------
+        // CLOSE GRIPPER
+        // ----------------------------------------------------
 
         case 'x':
         case 'X':
 
-            gripperOpening -= 0.05f;
+            gripperOpening -= 0.04f;
 
-            if (gripperOpening < 0.15f)
-                gripperOpening = 0.15f;
+            if (gripperOpening <
+                minimumOpening)
+            {
+                gripperOpening =
+                    minimumOpening;
+            }
 
             break;
 
@@ -1262,7 +2163,9 @@ void keyboard(
 
         case 'p':
         case 'P':
+
             tryGrab();
+
             break;
 
         // ----------------------------------------------------
@@ -1271,7 +2174,9 @@ void keyboard(
 
         case 'l':
         case 'L':
+
             releaseGrabbedObject();
+
             break;
 
         // ----------------------------------------------------
@@ -1280,11 +2185,25 @@ void keyboard(
 
         case 'r':
         case 'R':
-            resetRobot();
+
+            resetSimulation();
+
             break;
 
         // ----------------------------------------------------
-        // ZOOM
+        // FORCE VISUALIZATION
+        // ----------------------------------------------------
+
+        case 'f':
+        case 'F':
+
+            showForces =
+                !showForces;
+
+            break;
+
+        // ----------------------------------------------------
+        // ZOOM IN
         // ----------------------------------------------------
 
         case '+':
@@ -1296,6 +2215,10 @@ void keyboard(
                 cameraDistance = 5.0f;
 
             break;
+
+        // ----------------------------------------------------
+        // ZOOM OUT
+        // ----------------------------------------------------
 
         case '-':
         case '_':
@@ -1312,7 +2235,9 @@ void keyboard(
         // ----------------------------------------------------
 
         case 27:
+
             std::exit(0);
+
             break;
     }
 
@@ -1332,14 +2257,19 @@ void specialKeys(
     switch (key)
     {
         case GLUT_KEY_LEFT:
+
             cameraYaw -= 5.0f;
+
             break;
 
         case GLUT_KEY_RIGHT:
+
             cameraYaw += 5.0f;
+
             break;
 
         case GLUT_KEY_UP:
+
             cameraPitch += 3.0f;
 
             if (cameraPitch > 75.0f)
@@ -1348,6 +2278,7 @@ void specialKeys(
             break;
 
         case GLUT_KEY_DOWN:
+
             cameraPitch -= 3.0f;
 
             if (cameraPitch < 5.0f)
@@ -1360,23 +2291,16 @@ void specialKeys(
 }
 
 // ============================================================
-// UPDATE
-// ============================================================
-
-void update()
-{
-    updateGrabbedObject();
-
-    glutPostRedisplay();
-}
-
-// ============================================================
 // TIMER
 // ============================================================
 
-void timer(int value)
+void timer(
+    int value
+)
 {
-    update();
+    updatePhysics();
+
+    glutPostRedisplay();
 
     glutTimerFunc(
         16,
@@ -1406,19 +2330,15 @@ void initOpenGL()
         GL_NORMALIZE
     );
 
-    glEnable(
-        GL_CULL_FACE
+    glShadeModel(
+        GL_SMOOTH
     );
 
-    glCullFace(
-        GL_BACK
-    );
+    setupLighting();
 
     glEnable(
         GL_COLOR_MATERIAL
     );
-
-    setupLighting();
 }
 
 // ============================================================
@@ -1430,10 +2350,6 @@ int main(
     char** argv
 )
 {
-    // --------------------------------------------------------
-    // GLUT INITIALIZATION
-    // --------------------------------------------------------
-
     glutInit(
         &argc,
         argv
@@ -1456,19 +2372,12 @@ int main(
     );
 
     glutCreateWindow(
-        "OpenGL Robotic Arm - Two Finger Gripper"
+        "OpenGL Robotic Arm - Physics Simulation"
     );
-
-    // --------------------------------------------------------
-    // OPENGL INITIALIZATION
-    // --------------------------------------------------------
 
     initOpenGL();
 
-    // --------------------------------------------------------
-    // CALLBACK FUNCTIONS
-    // --------------------------------------------------------
-
+    // Callbacks
     glutDisplayFunc(
         display
     );
@@ -1491,10 +2400,10 @@ int main(
         0
     );
 
-    // --------------------------------------------------------
-    // START MAIN LOOP
-    // --------------------------------------------------------
+    // Initial state
+    resetSimulation();
 
+    // Main GLUT loop
     glutMainLoop();
 
     return 0;
